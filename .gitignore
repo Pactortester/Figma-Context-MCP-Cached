@@ -1,0 +1,43 @@
+# Dependencies
+node_modules
+.pnpm-store
+package-lock.json
+.github
+.changeset
+# Build output
+dist
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Testing
+coverage
+test-output
+
+# OS
+.DS_Store
+Thumbs.db
+
+# mcp-publisher CLI tool files
+.mcpregistry*
