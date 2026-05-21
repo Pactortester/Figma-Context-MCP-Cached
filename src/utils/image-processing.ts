@@ -142,6 +142,33 @@ export async function downloadAndProcessImage(
   const { Logger } = await import("./logger.js");
   const processingLog: string[] = [];
 
+  const targetPath = path.join(localPath, fileName);
+  try {
+    const stats = await fs.promises.stat(targetPath);
+    if (stats.size > 0) {
+      Logger.log(`[SmartImageCache] Local file already exists: ${targetPath}. Skipping download and processing.`);
+      
+      const dimensions = await getImageDimensions(targetPath);
+      let cssVariables: string | undefined;
+      if (requiresImageDimensions) {
+        cssVariables = generateImageCSSVariables(dimensions);
+      }
+      
+      return {
+        filePath: targetPath,
+        originalDimensions: dimensions,
+        finalDimensions: dimensions,
+        wasCropped: needsCropping && !!cropTransform,
+        cssVariables,
+        processingLog: ["Reused existing cached local image file."],
+      };
+    }
+  } catch (cacheErr: any) {
+    if (cacheErr?.code !== "ENOENT") {
+      Logger.log(`[SmartImageCache] Error checking cache for ${targetPath}: ${cacheErr.message}. Fallback to full download.`);
+    }
+  }
+
   // First download the original image
   const { downloadFigmaImage } = await import("./common.js");
   const originalPath = await downloadFigmaImage(fileName, localPath, imageUrl);

@@ -7,13 +7,13 @@
     "url": "https://github.com/Pactortester/Figma-Context-MCP-Cached",
     "source": "github"
   },
-  "version": "1.1.2",
+  "version": "1.2.0",
   "packages": [
     {
       "registry_type": "npm",
       "registry_base_url": "https://registry.npmjs.org",
       "identifier": "@pactortester/figma-mcp-cached",
-      "version": "1.1.2",
+      "version": "1.2.0",
       "transport": {
         "type": "stdio"
       },

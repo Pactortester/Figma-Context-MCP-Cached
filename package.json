@@ -1,6 +1,6 @@
 {
   "name": "@pactortester/figma-mcp-cached",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "mcpName": "io.github.Pactortester/Figma-Context-MCP-Cached",
   "description": "Cache‑enabled Figma Context MCP with persistent disk caching to reduce API rate limits and improve performance.",
   "type": "module",
@@ -47,6 +47,10 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Pactortester/Figma-Context-MCP-Cached.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "homepage": "https://github.com/Pactortester/Figma-Context-MCP-Cached#readme",
   "bugs": {

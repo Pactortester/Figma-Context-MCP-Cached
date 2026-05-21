@@ -214,3 +214,37 @@ export function pixelRound(num: number): number {
   }
   return Number(Number(num).toFixed(2));
 }
+
+/**
+ * 限制并发执行的异步任务调度器
+ * @param items 要处理的数组项
+ * @param limit 最大并发数
+ * @param fn 处理函数，接收当前项和索引，返回 Promise
+ */
+export async function limitConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  
+  const results: R[] = new Array(items.length);
+  let currentIndex = 0;
+
+  async function worker() {
+    while (currentIndex < items.length) {
+      const index = currentIndex++;
+      const item = items[index];
+      results[index] = await fn(item, index);
+    }
+  }
+
+  const workers = [];
+  const workerCount = Math.min(limit, items.length);
+  for (let i = 0; i < workerCount; i++) {
+    workers.push(worker());
+  }
+
+  await Promise.all(workers);
+  return results;
+}

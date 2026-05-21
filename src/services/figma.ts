@@ -12,6 +12,7 @@ import { downloadAndProcessImage, type ImageProcessingResult } from "~/utils/ima
 import { Logger, writeLogs } from "~/utils/logger.js";
 import { fetchWithRetry } from "~/utils/fetch-with-retry.js";
 import { FigmaFileCache, type FigmaCachingOptions } from "./figma-file-cache.js";
+import { limitConcurrency } from "~/utils/common.js";
 
 export type FigmaAuthOptions = {
   figmaApiKey: string;
@@ -189,7 +190,6 @@ export class FigmaService {
     }
 
     const { pngScale = 2, svgOptions } = options;
-    const downloadPromises: Promise<ImageProcessingResult[]>[] = [];
 
     // Separate items by type
     const imageFills = items.filter(
@@ -199,96 +199,91 @@ export class FigmaService {
       (item): item is typeof item & { nodeId: string } => !!item.nodeId,
     );
 
-    // Download image fills with processing
-    if (imageFills.length > 0) {
-      const fillUrls = await this.getImageFillUrls(fileKey);
-      const fillDownloads = imageFills
-        .map(({ imageRef, fileName, needsCropping, cropTransform, requiresImageDimensions }) => {
-          const imageUrl = fillUrls[imageRef];
-          return imageUrl
-            ? downloadAndProcessImage(
-                fileName,
-                resolvedPath,
-                imageUrl,
-                needsCropping,
-                cropTransform,
-                requiresImageDimensions,
-              )
-            : null;
-        })
-        .filter((promise): promise is Promise<ImageProcessingResult> => promise !== null);
+    const pngNodes = renderNodes.filter((node) => !node.fileName.toLowerCase().endsWith(".svg"));
+    const svgNodes = renderNodes.filter((node) => node.fileName.toLowerCase().endsWith(".svg"));
 
-      if (fillDownloads.length > 0) {
-        downloadPromises.push(Promise.all(fillDownloads));
+    // 1. Gather all API image URLs concurrently (only a few bulk API requests)
+    const fillUrlsPromise = imageFills.length > 0 ? this.getImageFillUrls(fileKey) : Promise.resolve({} as Record<string, string>);
+    const pngUrlsPromise = pngNodes.length > 0
+      ? this.getNodeRenderUrls(fileKey, pngNodes.map((n) => n.nodeId), "png", { pngScale })
+      : Promise.resolve({} as Record<string, string>);
+    const svgUrlsPromise = svgNodes.length > 0
+      ? this.getNodeRenderUrls(fileKey, svgNodes.map((n) => n.nodeId), "svg", { svgOptions })
+      : Promise.resolve({} as Record<string, string>);
+
+    const [fillUrls, pngUrls, svgUrls] = await Promise.all([
+      fillUrlsPromise,
+      pngUrlsPromise,
+      svgUrlsPromise,
+    ]);
+
+    // 2. Build a flat array of all image download & processing tasks
+    const downloadTasks: Array<{
+      fileName: string;
+      imageUrl: string;
+      needsCropping: boolean;
+      cropTransform?: Transform;
+      requiresImageDimensions: boolean;
+    }> = [];
+
+    // Add imageFills tasks
+    for (const item of imageFills) {
+      const imageUrl = fillUrls[item.imageRef];
+      if (imageUrl) {
+        downloadTasks.push({
+          fileName: item.fileName,
+          imageUrl,
+          needsCropping: item.needsCropping || false,
+          cropTransform: item.cropTransform,
+          requiresImageDimensions: item.requiresImageDimensions || false,
+        });
       }
     }
 
-    // Download rendered nodes with processing
-    if (renderNodes.length > 0) {
-      const pngNodes = renderNodes.filter((node) => !node.fileName.toLowerCase().endsWith(".svg"));
-      const svgNodes = renderNodes.filter((node) => node.fileName.toLowerCase().endsWith(".svg"));
-
-      // Download PNG renders
-      if (pngNodes.length > 0) {
-        const pngUrls = await this.getNodeRenderUrls(
-          fileKey,
-          pngNodes.map((n) => n.nodeId),
-          "png",
-          { pngScale },
-        );
-        const pngDownloads = pngNodes
-          .map(({ nodeId, fileName, needsCropping, cropTransform, requiresImageDimensions }) => {
-            const imageUrl = pngUrls[nodeId];
-            return imageUrl
-              ? downloadAndProcessImage(
-                  fileName,
-                  resolvedPath,
-                  imageUrl,
-                  needsCropping,
-                  cropTransform,
-                  requiresImageDimensions,
-                )
-              : null;
-          })
-          .filter((promise): promise is Promise<ImageProcessingResult> => promise !== null);
-
-        if (pngDownloads.length > 0) {
-          downloadPromises.push(Promise.all(pngDownloads));
-        }
-      }
-
-      // Download SVG renders
-      if (svgNodes.length > 0) {
-        const svgUrls = await this.getNodeRenderUrls(
-          fileKey,
-          svgNodes.map((n) => n.nodeId),
-          "svg",
-          { svgOptions },
-        );
-        const svgDownloads = svgNodes
-          .map(({ nodeId, fileName, needsCropping, cropTransform, requiresImageDimensions }) => {
-            const imageUrl = svgUrls[nodeId];
-            return imageUrl
-              ? downloadAndProcessImage(
-                  fileName,
-                  resolvedPath,
-                  imageUrl,
-                  needsCropping,
-                  cropTransform,
-                  requiresImageDimensions,
-                )
-              : null;
-          })
-          .filter((promise): promise is Promise<ImageProcessingResult> => promise !== null);
-
-        if (svgDownloads.length > 0) {
-          downloadPromises.push(Promise.all(svgDownloads));
-        }
+    // Add PNG node tasks
+    for (const item of pngNodes) {
+      const imageUrl = pngUrls[item.nodeId];
+      if (imageUrl) {
+        downloadTasks.push({
+          fileName: item.fileName,
+          imageUrl,
+          needsCropping: item.needsCropping || false,
+          cropTransform: item.cropTransform,
+          requiresImageDimensions: item.requiresImageDimensions || false,
+        });
       }
     }
 
-    const results = await Promise.all(downloadPromises);
-    return results.flat();
+    // Add SVG node tasks
+    for (const item of svgNodes) {
+      const imageUrl = svgUrls[item.nodeId];
+      if (imageUrl) {
+        downloadTasks.push({
+          fileName: item.fileName,
+          imageUrl,
+          needsCropping: item.needsCropping || false,
+          cropTransform: item.cropTransform,
+          requiresImageDimensions: item.requiresImageDimensions || false,
+        });
+      }
+    }
+
+    // 3. Process all download & crop tasks with a concurrency limit of 5
+    const CONCURRENCY_LIMIT = 5;
+    Logger.log(`[FigmaService] Starting batch download of ${downloadTasks.length} images with a concurrency limit of ${CONCURRENCY_LIMIT}`);
+    
+    const results = await limitConcurrency(downloadTasks, CONCURRENCY_LIMIT, async (task) => {
+      return downloadAndProcessImage(
+        task.fileName,
+        resolvedPath,
+        task.imageUrl,
+        task.needsCropping,
+        task.cropTransform,
+        task.requiresImageDimensions,
+      );
+    });
+
+    return results;
   }
 
   /**
