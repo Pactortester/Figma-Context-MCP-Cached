@@ -217,7 +217,7 @@ export function getServerConfig(isStdioMode: boolean): ServerConfig {
       `- SKIP_IMAGE_DOWNLOADS: ${config.skipImageDownloads} (source: ${config.configSources.skipImageDownloads})`,
     );
     console.log(
-      `- FIGMA_CACHING: ${config.caching ? JSON.stringify({ cacheDir: config.caching.cacheDir, ttlMs: config.caching.ttlMs }) : "disabled"} (source: ${config.configSources.caching ?? "none"})`,
+      `- FIGMA_CACHING: ${config.caching ? JSON.stringify({ cacheDir: config.caching.cacheDir, ttlMs: config.caching.ttlMs, autoCleanup: config.caching.autoCleanup ?? true, cleanupIntervalMs: config.caching.cleanupIntervalMs }) : "disabled"} (source: ${config.configSources.caching ?? "none"})`,
     );
     console.log(); // Empty line for better readability
   }
@@ -238,6 +238,13 @@ function parseCachingConfig(rawValue: string | undefined): FigmaCachingOptions |
         value: number;
         unit: DurationUnit;
       };
+      autoCleanup?: boolean;
+      cleanupInterval?: {
+        value: number;
+        unit: DurationUnit;
+      };
+      maxMemoryCacheSize?: number;
+      encryptionKey?: string;
     };
 
     if (!parsed || typeof parsed !== "object") {
@@ -255,10 +262,44 @@ function parseCachingConfig(rawValue: string | undefined): FigmaCachingOptions |
     const ttlMs = parsed.ttl.value * DURATION_IN_MS[parsed.ttl.unit];
     const cacheDir = resolveCacheDir(parsed.cacheDir);
 
-    return {
+    const result: FigmaCachingOptions = {
       cacheDir,
       ttlMs,
     };
+
+    // Parse optional autoCleanup
+    if (parsed.autoCleanup !== undefined) {
+      result.autoCleanup = parsed.autoCleanup;
+    }
+
+    // Parse optional cleanupInterval
+    if (parsed.cleanupInterval) {
+      if (typeof parsed.cleanupInterval.value !== "number" || parsed.cleanupInterval.value <= 0) {
+        throw new Error("FIGMA_CACHING.cleanupInterval.value must be a positive number");
+      }
+      if (!(parsed.cleanupInterval.unit in DURATION_IN_MS)) {
+        throw new Error("FIGMA_CACHING.cleanupInterval.unit must be one of ms, s, m, h, d");
+      }
+      result.cleanupIntervalMs = parsed.cleanupInterval.value * DURATION_IN_MS[parsed.cleanupInterval.unit];
+    }
+
+    // Parse optional maxMemoryCacheSize
+    if (parsed.maxMemoryCacheSize !== undefined) {
+      if (typeof parsed.maxMemoryCacheSize !== "number" || parsed.maxMemoryCacheSize <= 0) {
+        throw new Error("FIGMA_CACHING.maxMemoryCacheSize must be a positive number");
+      }
+      result.maxMemoryCacheSize = parsed.maxMemoryCacheSize;
+    }
+
+    // Parse optional encryptionKey
+    if (parsed.encryptionKey !== undefined) {
+      if (typeof parsed.encryptionKey !== "string" || parsed.encryptionKey.length === 0) {
+        throw new Error("FIGMA_CACHING.encryptionKey must be a non-empty string");
+      }
+      result.encryptionKey = parsed.encryptionKey;
+    }
+
+    return result;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`Failed to parse FIGMA_CACHING: ${message}`);

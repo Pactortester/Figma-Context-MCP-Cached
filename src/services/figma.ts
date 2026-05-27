@@ -12,6 +12,7 @@ import { downloadAndProcessImage, type ImageProcessingResult } from "~/utils/ima
 import { Logger, writeLogs } from "~/utils/logger.js";
 import { fetchWithRetry } from "~/utils/fetch-with-retry.js";
 import { FigmaFileCache, type FigmaCachingOptions } from "./figma-file-cache.js";
+import { LRUCache } from "~/utils/lru-cache.js";
 import { limitConcurrency } from "~/utils/common.js";
 
 export type FigmaAuthOptions = {
@@ -45,6 +46,9 @@ export class FigmaService {
   private readonly useOAuth: boolean;
   private readonly baseUrl = "https://api.figma.com/v1";
   private readonly fileCache?: FigmaFileCache;
+  private readonly nodeCache: LRUCache<string, GetFileNodesResponse>;
+  private readonly NODE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes TTL for node cache
+  private readonly NODE_CACHE_MAX_SIZE = 50; // Maximum 50 nodes in memory
 
   constructor(
     { figmaApiKey, figmaOAuthToken, useOAuth }: FigmaAuthOptions,
@@ -53,6 +57,7 @@ export class FigmaService {
     this.apiKey = figmaApiKey || "";
     this.oauthToken = figmaOAuthToken || "";
     this.useOAuth = !!useOAuth && !!this.oauthToken;
+    this.nodeCache = new LRUCache(this.NODE_CACHE_MAX_SIZE, this.NODE_CACHE_TTL);
     if (cachingOptions) {
       this.fileCache = new FigmaFileCache(cachingOptions);
     }
@@ -323,9 +328,23 @@ export class FigmaService {
     nodeId: string,
     depth?: number | null,
   ): Promise<{ data: GetFileNodesResponse; cacheInfo: CacheInfo }> {
+    // Create a cache key that includes depth
+    const nodeCacheKey = `${fileKey}:${nodeId}:${depth ?? "full"}`;
+
+    // Check node-level memory cache first
+    const cachedNode = this.nodeCache.get(nodeCacheKey);
+    if (cachedNode) {
+      Logger.log(`[FigmaService] Node cache hit for ${nodeId} in ${fileKey}`);
+      return { data: cachedNode, cacheInfo: { usedCache: true } };
+    }
+
     if (this.fileCache) {
       const cacheResult = await this.loadFileFromCache(fileKey);
       const nodeResponse = buildNodeResponseFromFile(cacheResult.data, nodeId, depth);
+
+      // Cache the node response in memory
+      this.nodeCache.set(nodeCacheKey, nodeResponse);
+
       writeLogs("figma-raw.json", nodeResponse);
       return { data: nodeResponse, cacheInfo: cacheResult.cacheInfo };
     }
@@ -336,6 +355,10 @@ export class FigmaService {
     );
 
     const response = await this.request<GetFileNodesResponse>(endpoint);
+
+    // Cache the node response in memory
+    this.nodeCache.set(nodeCacheKey, response);
+
     writeLogs("figma-raw.json", response);
 
     return { data: response, cacheInfo: { usedCache: false } };
@@ -585,6 +608,36 @@ export class FigmaService {
     );
 
     return this.request<GetFileResponse>(endpoint);
+  }
+
+  /**
+   * Get cache statistics if caching is enabled
+   */
+  async getCacheStats() {
+    if (!this.fileCache) {
+      return null;
+    }
+    return this.fileCache.getStats();
+  }
+
+  /**
+   * Clean up expired cache files if caching is enabled
+   */
+  async cleanupExpiredCache(): Promise<number> {
+    if (!this.fileCache) {
+      return 0;
+    }
+    return this.fileCache.cleanupExpired();
+  }
+
+  /**
+   * Destroy the service and clean up resources
+   */
+  destroy(): void {
+    if (this.fileCache) {
+      this.fileCache.destroy();
+    }
+    this.nodeCache.clear();
   }
 }
 

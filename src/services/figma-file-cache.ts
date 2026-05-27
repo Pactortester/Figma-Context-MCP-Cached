@@ -1,16 +1,27 @@
-import { access, constants, mkdir, readFile, rename, unlink, writeFile } from "fs/promises";
+import { access, constants, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "fs/promises";
 import path from "path";
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
 import type { GetFileResponse } from "@figma/rest-api-spec";
 import { Logger } from "~/utils/logger.js";
+import { LRUCache } from "~/utils/lru-cache.js";
 import { gzip, gunzip } from "zlib";
 import { promisify } from "util";
 
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
 
+const ALGORITHM = "aes-256-cbc";
+const KEY_LENGTH = 32;
+const IV_LENGTH = 16;
+const SALT_LENGTH = 16;
+
 export type FigmaCachingOptions = {
   cacheDir: string;
   ttlMs: number;
+  autoCleanup?: boolean;
+  cleanupIntervalMs?: number;
+  maxMemoryCacheSize?: number;
+  encryptionKey?: string;
 };
 
 type StoredFilePayload = {
@@ -21,10 +32,15 @@ type StoredFilePayload = {
 export class FigmaFileCache {
   private initPromise: Promise<void>;
   private migrationsInProgress = new Set<string>(); // 记录正在进行后台迁移的 key
-  private readCacheMemory = new Map<string, { payload: StoredFilePayload; readAt: number }>(); // 短期内存读取缓存，防御连续 has()+get() 带来的解包开销
+  private readCacheMemory: LRUCache<string, { payload: StoredFilePayload; readAt: number }>;
   private readonly MEMORY_CACHE_TTL = 1000; // 短效 TTL 为 1 秒，足够覆盖瞬时连招
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
+  private readonly DEFAULT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 默认每小时清理一次
+  private readonly DEFAULT_MAX_MEMORY_CACHE_SIZE = 100; // 默认最大内存缓存条目数
 
   constructor(private readonly options: FigmaCachingOptions) {
+    const maxMemoryCacheSize = options.maxMemoryCacheSize || this.DEFAULT_MAX_MEMORY_CACHE_SIZE;
+    this.readCacheMemory = new LRUCache(maxMemoryCacheSize, this.MEMORY_CACHE_TTL);
     this.initPromise = this.initialize();
   }
 
@@ -37,6 +53,11 @@ export class FigmaFileCache {
       await access(this.options.cacheDir, constants.W_OK);
 
       Logger.log(`[FigmaFileCache] Initialized cache directory: ${this.options.cacheDir}`);
+
+      // Start auto cleanup if enabled
+      if (this.options.autoCleanup !== false) {
+        this.startCleanupTask();
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -62,7 +83,50 @@ export class FigmaFileCache {
   }
 
   /**
-   * 内部读取缓存文件，处理 gzip 解压与向下兼容
+   * Derive encryption key from user-provided key using scrypt
+   */
+  private deriveKey(salt: Buffer): Buffer {
+    if (!this.options.encryptionKey) {
+      throw new Error("Encryption key not configured");
+    }
+    return scryptSync(this.options.encryptionKey, salt, KEY_LENGTH);
+  }
+
+  /**
+   * Encrypt data using AES-256-CBC
+   */
+  private encrypt(data: string): Buffer {
+    const salt = randomBytes(SALT_LENGTH);
+    const key = this.deriveKey(salt);
+    const iv = randomBytes(IV_LENGTH);
+    const cipher = createCipheriv(ALGORITHM, key, iv);
+    const encrypted = Buffer.concat([cipher.update(data, "utf8"), cipher.final()]);
+    // Format: salt + iv + encrypted data
+    return Buffer.concat([salt, iv, encrypted]);
+  }
+
+  /**
+   * Decrypt data using AES-256-CBC
+   */
+  private decrypt(encryptedBuffer: Buffer): string {
+    const salt = encryptedBuffer.subarray(0, SALT_LENGTH);
+    const iv = encryptedBuffer.subarray(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
+    const encryptedData = encryptedBuffer.subarray(SALT_LENGTH + IV_LENGTH);
+    const key = this.deriveKey(salt);
+    const decipher = createDecipheriv(ALGORITHM, key, iv);
+    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+    return decrypted.toString("utf8");
+  }
+
+  /**
+   * Check if encryption is enabled
+   */
+  private get isEncryptionEnabled(): boolean {
+    return !!this.options.encryptionKey;
+  }
+
+  /**
+   * 内部读取缓存文件，处理 gzip 解压、加密与向下兼容
    */
   private async readCacheFile(fileKey: string): Promise<StoredFilePayload | null> {
     // 0. 优先命中瞬时内存读取缓存，防 has()+get() 重复解压磁盘大文件
@@ -81,7 +145,16 @@ export class FigmaFileCache {
     // 1. 优先尝试读取新的压缩文件 (.json.gz)
     try {
       const buffer = await readFile(compressedPath);
-      const decompressed = await gunzipAsync(buffer);
+      let decompressed: Buffer;
+
+      if (this.isEncryptionEnabled) {
+        // Decrypt then decompress
+        const decrypted = this.decrypt(buffer);
+        decompressed = await gunzipAsync(Buffer.from(decrypted, "utf-8"));
+      } else {
+        decompressed = await gunzipAsync(buffer);
+      }
+
       const payload = JSON.parse(decompressed.toString("utf-8")) as StoredFilePayload;
 
       // 验证 payload 结构 (修复 Bug 6: 补上 !payload.data 校验)
@@ -237,10 +310,19 @@ export class FigmaFileCache {
 
     try {
       const jsonString = JSON.stringify(payload);
-      const compressedBuffer = await gzipAsync(Buffer.from(jsonString, "utf-8"));
+      let bufferToWrite: Buffer;
+
+      if (this.isEncryptionEnabled) {
+        // Compress then encrypt
+        const compressedBuffer = await gzipAsync(Buffer.from(jsonString, "utf-8"));
+        bufferToWrite = this.encrypt(compressedBuffer.toString("binary"));
+        Logger.log(`[FigmaFileCache] Encrypting cache for ${fileKey}`);
+      } else {
+        bufferToWrite = await gzipAsync(Buffer.from(jsonString, "utf-8"));
+      }
 
       // 写入临时压缩文件，然后原子重命名
-      await writeFile(tempPath, compressedBuffer);
+      await writeFile(tempPath, bufferToWrite);
       await rename(tempPath, compressedPath);
 
       // 成功写入后删除可能残留的旧明文缓存
@@ -248,7 +330,7 @@ export class FigmaFileCache {
       
       // 同步缓存到短效内存中以防后续 get() 重复磁盘 I/O 和解压
       this.readCacheMemory.set(fileKey, { payload, readAt: Date.now() });
-      Logger.log(`[FigmaFileCache] Cached and compressed file ${fileKey}`);
+      Logger.log(`[FigmaFileCache] Cached and compressed file ${fileKey}${this.isEncryptionEnabled ? " (encrypted)" : ""}`);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       Logger.log(`[FigmaFileCache] Failed to write cache for ${fileKey}: ${message}`);
@@ -257,6 +339,128 @@ export class FigmaFileCache {
       await this.safeDelete(tempPath);
       throw new Error(`Figma cache write failed: ${message}`);
     }
+  }
+
+  /**
+   * Start the automatic cleanup task
+   */
+  private startCleanupTask(): void {
+    const intervalMs = this.options.cleanupIntervalMs || this.DEFAULT_CLEANUP_INTERVAL_MS;
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupExpired().catch((error) => {
+        Logger.log(`[FigmaFileCache] Cleanup task failed: ${String(error)}`);
+      });
+    }, intervalMs);
+
+    // Allow Node.js to exit even if the timer is still running
+    if (this.cleanupInterval.unref) {
+      this.cleanupInterval.unref();
+    }
+
+    Logger.log(`[FigmaFileCache] Auto cleanup scheduled every ${intervalMs / 1000}s`);
+  }
+
+  /**
+   * Clean up expired cache files
+   * @returns Number of files deleted
+   */
+  async cleanupExpired(): Promise<number> {
+    await this.waitForInit();
+
+    let deletedCount = 0;
+    try {
+      const files = await readdir(this.options.cacheDir);
+      const cacheFiles = files.filter(
+        (f) => f.endsWith(".json.gz") || f.endsWith(".json"),
+      );
+
+      for (const file of cacheFiles) {
+        const filePath = path.join(this.options.cacheDir, file);
+        try {
+          const fileContent = file.endsWith(".json.gz")
+            ? await readFile(filePath).then((buf) => gunzipAsync(buf))
+            : await readFile(filePath, "utf-8");
+
+          const payload = JSON.parse(
+            fileContent.toString("utf-8"),
+          ) as StoredFilePayload;
+
+          if (!payload || typeof payload.fetchedAt !== "number" || this.isExpired(payload.fetchedAt)) {
+            await this.safeDelete(filePath);
+            deletedCount++;
+            Logger.log(`[FigmaFileCache] Cleaned up expired cache: ${file}`);
+          }
+        } catch {
+          // If we can't read or parse, consider it corrupted and delete
+          await this.safeDelete(filePath);
+          deletedCount++;
+          Logger.log(`[FigmaFileCache] Cleaned up corrupted cache: ${file}`);
+        }
+      }
+
+      if (deletedCount > 0) {
+        Logger.log(`[FigmaFileCache] Cleanup complete: removed ${deletedCount} expired/corrupted files`);
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      Logger.log(`[FigmaFileCache] Error during cleanup: ${message}`);
+    }
+
+    // Clear memory cache as well
+    this.readCacheMemory.clear();
+
+    return deletedCount;
+  }
+
+  /**
+   * Get cache statistics
+   */
+  async getStats(): Promise<{
+    fileCount: number;
+    totalSizeBytes: number;
+    cacheDir: string;
+    ttlMs: number;
+  }> {
+    await this.waitForInit();
+
+    let fileCount = 0;
+    let totalSizeBytes = 0;
+
+    try {
+      const files = await readdir(this.options.cacheDir);
+      const cacheFiles = files.filter(
+        (f) => f.endsWith(".json.gz") || f.endsWith(".json"),
+      );
+      fileCount = cacheFiles.length;
+
+      for (const file of cacheFiles) {
+        const filePath = path.join(this.options.cacheDir, file);
+        const fileStat = await stat(filePath);
+        totalSizeBytes += fileStat.size;
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      Logger.log(`[FigmaFileCache] Error getting stats: ${message}`);
+    }
+
+    return {
+      fileCount,
+      totalSizeBytes,
+      cacheDir: this.options.cacheDir,
+      ttlMs: this.options.ttlMs,
+    };
+  }
+
+  /**
+   * Destroy the cache instance and clean up resources
+   */
+  destroy(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.readCacheMemory.clear();
+    Logger.log("[FigmaFileCache] Cache instance destroyed");
   }
 
   private async safeDelete(cachePath: string): Promise<void> {

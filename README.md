@@ -5,8 +5,9 @@
   
   <br>
 
-  [![MCP Badge](https://lobehub.com/badge/mcp/pactortester-figma-context-mcp-cached)](https://lobehub.com/mcp/pactortester-figma-context-mcp-cached)
 </div>
+
+> **English Version**: [README_EN.md](./README_EN.md)
 
 基于 **Figma Context MCP** 的增强版本，通过**本地持久化缓存**显著减少对 Figma API 的请求次数，从而缓解速率限制问题，提升稳定性与响应速度。
 
@@ -26,9 +27,52 @@
 - ✅ **智能下载路径**：图片下载默认保存到系统下载文件夹（支持 Windows/macOS/Linux）
 - ✅ **优化的 LLM 调用引导**：自动引导正确的工具调用顺序
 - ✅ 完全兼容原有 MCP 接口与调用方式
+- ✅ **`list_cache` 工具**：查看缓存状态和统计信息
+- ✅ **`cleanup_cache` 工具**：清理过期和损坏的缓存文件
+- ✅ **自动缓存清理**：定时清理过期缓存，保持磁盘空间整洁
+- ✅ **LRU 内存缓存**：智能内存缓存，避免重复磁盘 I/O
+- ✅ **节点级别缓存**：内存中缓存已解析的节点数据
+- ✅ **可选缓存加密**：支持 AES-256-CBC 加密保护敏感设计数据
 - ✅ 适用于 Cursor 等 MCP 客户端
 
 ---
+
+## 🚀 快速开始（30 秒上手）
+
+### 1. 获取 Figma API Key
+访问 [Figma 开发者设置](https://www.figma.com/developers/api#access-tokens) 创建 Personal Access Token。
+
+### 2. 配置 MCP（以 Cursor 为例）
+
+在 Cursor 的 MCP 配置文件中添加：
+
+```json
+{
+  "mcpServers": {
+    "Figma-Context-MCP-Cached": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@pactortester/figma-mcp-cached",
+        "--stdio",
+        "--figma-api-key=YOUR_FIGMA_API_KEY",
+        "--figma-caching={\"ttl\":{\"value\":7,\"unit\":\"d\"}}"
+      ]
+    }
+  }
+}
+```
+
+### 3. 开始使用
+
+在 Cursor 中直接粘贴 Figma 链接，AI 会自动：
+1. 调用 `figma_prepare_file` 准备文件
+2. 调用 `get_figma_data` 获取设计数据
+
+> 💡 **提示**：首次请求会从 Figma API 获取数据并缓存，后续请求直接从本地缓存读取，速度提升 10 倍以上！
+
+---
+
 ## 📦 Figma 缓存机制说明（重要）
 > ⚠️ **请在设计相对稳定或已定稿后再启用缓存功能**
 本 MCP 默认支持对 Figma API 返回结果进行缓存（可配置 TTL），以减少 API 请求次数、提升响应速度并避免触发 Figma 的限流策略。
@@ -74,6 +118,8 @@
 
 ### 命令行参数（适合 MCP 市场托管）
 
+#### 基础配置
+
 ```json
 {
   "mcpServers": {
@@ -85,6 +131,25 @@
         "--stdio",
         "--figma-api-key=YOUR-KEY",
         "--figma-caching={\"ttl\":{\"value\":30,\"unit\":\"d\"}}"
+      ]
+    }
+  }
+}
+```
+
+#### 完整配置（包含所有可选项）
+
+```json
+{
+  "mcpServers": {
+    "Figma-Context-MCP-Cached": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@pactortester/figma-mcp-cached",
+        "--stdio",
+        "--figma-api-key=YOUR-KEY",
+        "--figma-caching={\"ttl\":{\"value\":30,\"unit\":\"d\"},\"cacheDir\":\"~/figma-cache\",\"autoCleanup\":true,\"cleanupInterval\":{\"value\":1,\"unit\":\"h\"},\"maxMemoryCacheSize\":200,\"encryptionKey\":\"your-secret-key\"}"
       ]
     }
   }
@@ -120,6 +185,40 @@
 - **Linux**：`~/.cache/figma-mcp`
 - **macOS**：`~/Library/Caches/FigmaMcp`
 - **Windows**：`%LOCALAPPDATA%/FigmaMcpCache`
+
+---
+
+### `autoCleanup`（可选）
+
+是否启用自动清理过期缓存。默认为 `true`。
+
+- `true`：自动定时清理过期缓存文件
+- `false`：禁用自动清理（需手动调用 `cleanup_cache` 工具）
+
+---
+
+### `cleanupInterval`（可选）
+
+自动清理的执行间隔。默认为每小时一次。
+
+- `value`：数值
+- `unit`：时间单位（同 `ttl`）
+
+---
+
+### `maxMemoryCacheSize`（可选）
+
+内存中缓存的最大条目数（LRU 淘汰）。默认为 `100`。
+
+设置为较小的值可以减少内存占用，设置为较大的值可以提高缓存命中率。
+
+---
+
+### `encryptionKey`（可选）
+
+缓存文件加密密钥。设置后，所有缓存文件将使用 AES-256-CBC 加密存储。
+
+适用于保护敏感设计数据的场景。密钥应妥善保管，丢失密钥将无法读取已加密的缓存。
 
 ---
 
@@ -281,6 +380,58 @@
 - 下载成功的图片数量
 - 保存路径
 - 每张图片的文件名、尺寸、是否裁剪等信息
+
+---
+
+### 4️⃣ `list_cache` - 查看缓存状态
+
+列出并显示当前缓存状态，包括缓存文件、总大小、缓存目录和 TTL 配置。
+
+**工具参数：** 无
+
+**返回信息：**
+- `enabled`：缓存是否已启用
+- `cacheDir`：缓存目录路径
+- `fileCount`：缓存文件数量
+- `totalSize`：人类可读的总缓存大小
+- `ttl`：人类可读的 TTL 时长
+
+**使用示例：**
+```json
+{}
+```
+
+**示例响应：**
+```json
+{
+  "enabled": true,
+  "cacheDir": "~/Library/Caches/FigmaMcp",
+  "fileCount": 5,
+  "totalSize": "15.7 MB",
+  "totalSizeBytes": 16462643,
+  "ttl": "7d",
+  "ttlMs": 604800000
+}
+```
+
+---
+
+### 5️⃣ `cleanup_cache` - 清理缓存
+
+清理过期和损坏的缓存文件。此工具会删除超过 TTL（生存时间）的缓存文件以及任何损坏的缓存条目。
+
+**工具参数：** 无
+
+**返回信息：**
+- `deletedFiles`：删除的文件数量
+- `previousSize`：清理前的缓存大小
+- `currentSize`：清理后的缓存大小
+- `currentFileCount`：剩余缓存文件数量
+
+**使用示例：**
+```json
+{}
+```
 
 ---
 

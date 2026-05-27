@@ -16,7 +16,7 @@ export default {
   },
   moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json", "node"],
   moduleNameMapper: {
-    "^~/(.*)\.js$": "<rootDir>/src/$1.ts",
+    "^~/(.*)\\.js$": "<rootDir>/src/$1.ts",
     "^~/(.*)$": "<rootDir>/src/$1",
     "^(\\.{1,2}/.*)\\.js$": "$1",
   },

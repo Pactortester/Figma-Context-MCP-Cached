@@ -2,6 +2,7 @@
 node_modules
 .pnpm-store
 backup
+OPTIMIZATION_PLAN.md
 package-lock.json
 .github
 .changeset

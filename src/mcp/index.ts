@@ -5,9 +5,13 @@ import {
   downloadFigmaImagesTool,
   figmaPrepareFileTool,
   getFigmaDataTool,
+  listCacheTool,
+  cleanupCacheTool,
   type DownloadImagesParams,
   type FigmaPrepareFileParams,
   type GetFigmaDataParams,
+  type ListCacheParams,
+  type CleanupCacheParams,
 } from "./tools/index.js";
 import type { FigmaCachingOptions } from "~/services/figma-file-cache.js";
 
@@ -75,6 +79,21 @@ function registerTools(
       (params: DownloadImagesParams) => downloadFigmaImagesTool.handler(params, figmaService),
     );
   }
+
+  // Register cache management tools
+  server.tool(
+    listCacheTool.name,
+    listCacheTool.description,
+    listCacheTool.parameters,
+    (params: ListCacheParams) => listCacheTool.handler(params, figmaService),
+  );
+
+  server.tool(
+    cleanupCacheTool.name,
+    cleanupCacheTool.description,
+    cleanupCacheTool.parameters,
+    (params: CleanupCacheParams) => cleanupCacheTool.handler(params, figmaService),
+  );
 }
 
 export { createServer };
